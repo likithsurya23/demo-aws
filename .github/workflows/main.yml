@@ -1,0 +1,97 @@
+
+name: Deploy to AWS
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: sam-login-likith
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v5
+
+      - name: Set up AWS SAM CLI
+        uses: aws-actions/setup-sam@v3
+        with:
+          use-installer: true
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build SAM Application
+        run: sam build
+
+      - name: Deploy SAM Infrastructure & Backend
+        run: |
+          sam deploy \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --stack-name "${STACK_NAME}" \
+            --resolve-s3 \
+            --capabilities CAPABILITY_IAM \
+            --region "${AWS_REGION}"
+
+      - name: Deploy Frontend to S3 & Invalidate CloudFront
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Fetching CloudFormation stack outputs..."
+
+          get_output() {
+            aws cloudformation describe-stacks \
+              --stack-name "$STACK_NAME" \
+              --region "$AWS_REGION" \
+              --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue | [0]" \
+              --output text
+          }
+
+          API_URL=$(get_output ApiURL)
+          BUCKET_NAME=$(get_output BucketName)
+          DISTRIBUTION_ID=$(get_output DistributionId)
+          WEBSITE_URL=$(get_output WebsiteURL)
+
+          echo "API URL: $API_URL"
+          echo "Bucket: $BUCKET_NAME"
+          echo "CloudFront Distribution: $DISTRIBUTION_ID"
+          echo "Website URL: $WEBSITE_URL"
+
+          # Inject the API URL into the frontend HTML.
+          sed -i "s|__API_URL__|$API_URL|g" frontend/index.html
+
+          # Upload the frontend file to the private S3 bucket.
+          aws s3 cp frontend/index.html \
+            "s3://${BUCKET_NAME}/index.html" \
+            --content-type "text/html"
+
+          # Refresh CloudFront cache.
+          aws cloudfront create-invalidation \
+            --distribution-id "$DISTRIBUTION_ID" \
+            --paths "/*"
+
+          # Add deployment details to the Actions summary.
+          {
+            echo "### Deployment Successful!"
+            echo "- **Frontend URL:** $WEBSITE_URL"
+            echo "- **API URL:** $API_URL"
+            echo "- **S3 Bucket:** $BUCKET_NAME"
+            echo "- **CloudFront ID:** $DISTRIBUTION_ID"
+          } >> "$GITHUB_STEP_SUMMARY"
